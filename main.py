@@ -5,7 +5,7 @@ from tkinter import ttk
 from random import choice, randint, shuffle
 import pyperclip
 import mysql.connector
-import cryptography
+import cryptography #haven't implement password encryption yet
 # ---------------------------- DATABASE CLASS ------------------------------- #
 class DatabaseManager:
     def __init__(self, host="localhost", user="appuser", password="app_password", database="passwords"):
@@ -80,7 +80,7 @@ class PasswordManagerApp:
     def show_frame(self, page):
         frame = self.frames[page]
         frame.tkraise()
-        if page == PasswordListScreen:  # auto-refresh when switching to password list
+        if page == PasswordListScreen:  
             frame.load_passwords()
 
 
@@ -125,7 +125,7 @@ class MainScreen(tk.Frame):
                command=lambda: self.controller.show_frame(PasswordListScreen)).grid(row=5, column=1, columnspan=2, sticky="e")
 
     def generate_password(self):
-        password = self.controller.generator.generate()   # <-- fix here
+        password = self.controller.generator.generate()   
         self.password_entry.delete(0, END)
         self.password_entry.insert(0, password)
 
@@ -144,7 +144,7 @@ class MainScreen(tk.Frame):
         )
 
         if is_ok:
-            self.controller.db.insert_user(website, email, password)  # <-- fix here
+            self.controller.db.insert_user(website, email, password)  #need fix here :D
             self.website_entry.delete(0, END)
             self.password_entry.delete(0, END)
 
@@ -181,7 +181,7 @@ class PasswordListScreen(tk.Frame):
         selected_item = self.tree.selection()
         if selected_item:
             values = self.tree.item(selected_item, "values")
-            password = values[2]  # third column
+            password = values[2] 
             pyperclip.copy(password)
             messagebox.showinfo("Copied", "Password copied to clipboard!")
 
