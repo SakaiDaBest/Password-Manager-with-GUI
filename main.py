@@ -5,7 +5,9 @@ from tkinter import ttk
 from random import choice, randint, shuffle
 import pyperclip
 import mysql.connector
-import cryptography #haven't implement password encryption yet
+import cryptography
+
+
 # ---------------------------- DATABASE CLASS ------------------------------- #
 class DatabaseManager:
     def __init__(self, host="localhost", user="appuser", password="app_password", database="passwords"):
@@ -16,26 +18,122 @@ class DatabaseManager:
             database=database
         )
         self.cursor = self.conn.cursor()
-        self._create_table()
+        self.current_user_id = None
+        self.is_admin = False
+        self._create_tables()
 
-    def _create_table(self):
+    def _create_tables(self):
+        # Create login_users table for authentication
         self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
+            CREATE TABLE IF NOT EXISTS login_users (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                website VARCHAR(50),
-                credential VARCHAR(50),
-                user_password VARCHAR(50)
+                username VARCHAR(50) UNIQUE,
+                password VARCHAR(50),
+                is_admin BOOLEAN DEFAULT FALSE
             )
         """)
 
+        # Create users table for passwords (now with user_id foreign key)
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT,
+                website VARCHAR(50),
+                credential VARCHAR(50),
+                user_password VARCHAR(50),
+                FOREIGN KEY (user_id) REFERENCES login_users(id)
+            )
+        """)
+
+        # Check if user_id column exists
+        try:
+            self.cursor.execute("SELECT user_id FROM users LIMIT 1")
+            self.cursor.fetchone()  # <-- FIX
+        except mysql.connector.errors.ProgrammingError:
+            print("Adding user_id column to users table...")
+            self.cursor.execute("ALTER TABLE users ADD COLUMN user_id INT")
+            self.cursor.execute("""
+                ALTER TABLE users
+                ADD FOREIGN KEY (user_id) REFERENCES login_users(id)
+            """)
+            self.conn.commit()
+
+        # Check if is_admin column exists, if not add it
+        try:
+            self.cursor.execute("SELECT is_admin FROM login_users LIMIT 1")
+            self.cursor.fetchone()  # <-- FIX: read result
+        except mysql.connector.errors.ProgrammingError:
+            print("Adding is_admin column to login_users table...")
+            self.cursor.execute("""
+                ALTER TABLE login_users ADD COLUMN is_admin BOOLEAN DEFAULT FALSE
+            """)
+            self.conn.commit()
+            print("is_admin column added successfully!")
+
+        # Insert default admin user if not exists
+        try:
+            self.cursor.execute("INSERT INTO login_users (username, password, is_admin) VALUES (%s, %s, %s)",
+                                ("admin", "admin123", True))
+            self.conn.commit()
+        except mysql.connector.IntegrityError:
+            pass
+
+        # Insert default user if not exists
+        try:
+            self.cursor.execute("INSERT INTO login_users (username, password, is_admin) VALUES (%s, %s, %s)",
+                                ("user", "123", False))
+            self.conn.commit()
+        except mysql.connector.IntegrityError:
+            pass
+
+    def create_user(self, username, password):
+        try:
+            query = "INSERT INTO login_users (username, password, is_admin) VALUES (%s, %s, %s)"
+            self.cursor.execute(query, (username, password, False))
+            self.conn.commit()
+            return True, "Account created successfully!"
+        except mysql.connector.IntegrityError:
+            return False, "Username already exists. Please choose a different username."
+
+    def verify_login(self, username, password):
+        query = "SELECT id, is_admin FROM login_users WHERE username=%s AND password=%s"
+        self.cursor.execute(query, (username, password))
+        result = self.cursor.fetchone()
+        if result:
+            self.current_user_id = result[0]
+            self.is_admin = result[1]
+            return True
+        return False
+
     def insert_user(self, website, credential, user_password):
-        query = "INSERT INTO users (website, credential, user_password) VALUES (%s, %s, %s)"
-        self.cursor.execute(query, (website, credential, user_password))
+        query = "INSERT INTO users (user_id, website, credential, user_password) VALUES (%s, %s, %s, %s)"
+        self.cursor.execute(query, (self.current_user_id, website, credential, user_password))
         self.conn.commit()
 
     def fetch_all(self):
-        self.cursor.execute("SELECT * FROM users")
+        query = "SELECT * FROM users WHERE user_id=%s"
+        self.cursor.execute(query, (self.current_user_id,))
         return self.cursor.fetchall()
+
+    def get_all_users(self):
+        """Admin function to get all users"""
+        query = "SELECT id, username, password FROM login_users WHERE is_admin=FALSE"
+        self.cursor.execute(query)
+        return self.cursor.fetchall()
+
+    def update_user_password(self, user_id, new_password):
+        """Admin function to update a user's master password"""
+        query = "UPDATE login_users SET password=%s WHERE id=%s"
+        self.cursor.execute(query, (new_password, user_id))
+        self.conn.commit()
+
+    def delete_user(self, user_id):
+        """Admin function to delete a user"""
+        # First delete all their saved passwords
+        self.cursor.execute("DELETE FROM users WHERE user_id=%s", (user_id,))
+        # Then delete the user account
+        self.cursor.execute("DELETE FROM login_users WHERE id=%s", (user_id,))
+        self.conn.commit()
 
 
 # ---------------------------- PASSWORD GENERATOR CLASS ------------------------------- #
@@ -70,18 +168,252 @@ class PasswordManagerApp:
         self.container.pack(fill="both", expand=True)
 
         self.frames = {}
-        for F in (MainScreen, PasswordListScreen):
+        for F in (LoginScreen, CreateUserScreen, MainScreen, PasswordListScreen, AdminDashboard):
             frame = F(self.container, self)
             self.frames[F] = frame
             frame.grid(row=0, column=0, sticky="nsew")
 
-        self.show_frame(MainScreen)
+        self.show_frame(LoginScreen)
 
     def show_frame(self, page):
         frame = self.frames[page]
         frame.tkraise()
-        if page == PasswordListScreen:  
+        if page == PasswordListScreen:
             frame.load_passwords()
+        elif page == AdminDashboard:
+            frame.load_users()
+
+
+# ---------------------------- LOGIN SCREEN ------------------------------- #
+class LoginScreen(tk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+        self.setup_ui()
+
+    def setup_ui(self):
+        # Title
+        Label(self, text="Password Manager", font=("Arial", 20, "bold")).pack(pady=30)
+        Label(self, text="Login", font=("Arial", 14)).pack(pady=10)
+
+        # Username
+        Label(self, text="Username:").pack(pady=5)
+        self.username_entry = Entry(self, width=30)
+        self.username_entry.pack(pady=5)
+        self.username_entry.focus()
+
+        # Password
+        Label(self, text="Password:").pack(pady=5)
+        self.password_entry = Entry(self, width=30, show="*")
+        self.password_entry.pack(pady=5)
+
+        # Login button
+        Button(self, text="Login", width=20, command=self.login).pack(pady=10)
+
+        # Create user button
+        Button(self, text="Create New Account", width=20,
+               command=lambda: self.controller.show_frame(CreateUserScreen)).pack(pady=5)
+
+        # Bind Enter key to login
+        self.password_entry.bind("<Return>", lambda e: self.login())
+
+    def login(self):
+        username = self.username_entry.get()
+        password = self.password_entry.get()
+
+        if len(username) == 0 or len(password) == 0:
+            messagebox.showerror("Error", "Please enter both username and password.")
+            return
+
+        if self.controller.db.verify_login(username, password):
+            messagebox.showinfo("Success", f"Welcome back, {username}!")
+            self.username_entry.delete(0, END)
+            self.password_entry.delete(0, END)
+
+            # Check if admin
+            if self.controller.db.is_admin:
+                self.controller.show_frame(AdminDashboard)
+            else:
+                self.controller.show_frame(MainScreen)
+        else:
+            messagebox.showerror("Error", "Invalid username or password.")
+            self.password_entry.delete(0, END)
+
+
+# ---------------------------- CREATE USER SCREEN ------------------------------- #
+class CreateUserScreen(tk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+        self.setup_ui()
+
+    def setup_ui(self):
+        # Title
+        Label(self, text="Create New Account", font=("Arial", 16, "bold")).pack(pady=30)
+
+        # Username
+        Label(self, text="Username:").pack(pady=5)
+        self.username_entry = Entry(self, width=30)
+        self.username_entry.pack(pady=5)
+        self.username_entry.focus()
+
+        # Password
+        Label(self, text="Password:").pack(pady=5)
+        self.password_entry = Entry(self, width=30, show="*")
+        self.password_entry.pack(pady=5)
+
+        # Confirm Password
+        Label(self, text="Confirm Password:").pack(pady=5)
+        self.confirm_password_entry = Entry(self, width=30, show="*")
+        self.confirm_password_entry.pack(pady=5)
+
+        # Create account button
+        Button(self, text="Create Account", width=20, command=self.create_account).pack(pady=20)
+
+        # Back button
+        Button(self, text="Back to Login", width=20,
+               command=lambda: self.controller.show_frame(LoginScreen)).pack(pady=5)
+
+        # Bind Enter key
+        self.confirm_password_entry.bind("<Return>", lambda e: self.create_account())
+
+    def create_account(self):
+        username = self.username_entry.get()
+        password = self.password_entry.get()
+        confirm_password = self.confirm_password_entry.get()
+
+        # Validation
+        if len(username) == 0 or len(password) == 0:
+            messagebox.showerror("Error", "Please fill in all fields.")
+            return
+
+        if len(username) < 3:
+            messagebox.showerror("Error", "Username must be at least 3 characters long.")
+            return
+
+        if len(password) < 3:
+            messagebox.showerror("Error", "Password must be at least 3 characters long.")
+            return
+
+        if password != confirm_password:
+            messagebox.showerror("Error", "Passwords do not match.")
+            return
+
+        # Try to create user
+        success, message = self.controller.db.create_user(username, password)
+
+        if success:
+            messagebox.showinfo("Success", message)
+            self.username_entry.delete(0, END)
+            self.password_entry.delete(0, END)
+            self.confirm_password_entry.delete(0, END)
+            self.controller.show_frame(LoginScreen)
+        else:
+            messagebox.showerror("Error", message)
+
+
+# ---------------------------- ADMIN DASHBOARD ------------------------------- #
+class AdminDashboard(tk.Frame):
+    def __init__(self, parent, controller):
+        super().__init__(parent)
+        self.controller = controller
+        self.setup_ui()
+
+    def setup_ui(self):
+        tk.Label(self, text="Admin Dashboard", font=("Arial", 20, "bold")).pack(pady=20)
+        tk.Label(self, text="Manage User Accounts", font=("Arial", 14)).pack(pady=10)
+
+        # Treeview for users
+        self.tree = ttk.Treeview(self, columns=("ID", "Username", "Password"), show="headings", height=10)
+        self.tree.heading("ID", text="ID")
+        self.tree.heading("Username", text="Username")
+        self.tree.heading("Password", text="Master Password")
+
+        self.tree.column("ID", width=50)
+        self.tree.column("Username", width=200)
+        self.tree.column("Password", width=200)
+
+        self.tree.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Buttons frame
+        button_frame = tk.Frame(self)
+        button_frame.pack(pady=10)
+
+        Button(button_frame, text="Edit Password", command=self.edit_password, width=15).pack(side="left", padx=5)
+        Button(button_frame, text="Delete User", command=self.delete_user, width=15).pack(side="left", padx=5)
+        Button(button_frame, text="Refresh", command=self.load_users, width=15).pack(side="left", padx=5)
+
+        Button(self, text="Logout", command=lambda: self.controller.show_frame(LoginScreen), width=20).pack(pady=10)
+
+    def load_users(self):
+        # Clear existing data
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        # Load all users
+        users = self.controller.db.get_all_users()
+        for user in users:
+            self.tree.insert("", "end", values=(user[0], user[1], user[2]))
+
+    def edit_password(self):
+        selected_item = self.tree.selection()
+        if not selected_item:
+            messagebox.showwarning("Warning", "Please select a user first.")
+            return
+
+        values = self.tree.item(selected_item, "values")
+        user_id = values[0]
+        username = values[1]
+
+        # Create popup window for editing
+        edit_window = tk.Toplevel(self)
+        edit_window.title(f"Edit Password for {username}")
+        edit_window.geometry("300x150")
+
+        Label(edit_window, text=f"User: {username}", font=("Arial", 12, "bold")).pack(pady=10)
+        Label(edit_window, text="New Master Password:").pack(pady=5)
+
+        new_password_entry = Entry(edit_window, width=30, show="*")
+        new_password_entry.pack(pady=5)
+        new_password_entry.focus()
+
+        def save_new_password():
+            new_password = new_password_entry.get()
+            if len(new_password) == 0:
+                messagebox.showerror("Error", "Password cannot be empty.")
+                return
+
+            if len(new_password) < 3:
+                messagebox.showerror("Error", "Password must be at least 3 characters long.")
+                return
+
+            self.controller.db.update_user_password(user_id, new_password)
+            messagebox.showinfo("Success", f"Password updated for {username}!")
+            edit_window.destroy()
+            self.load_users()
+
+        Button(edit_window, text="Save", command=save_new_password, width=15).pack(pady=10)
+        new_password_entry.bind("<Return>", lambda e: save_new_password())
+
+    def delete_user(self):
+        selected_item = self.tree.selection()
+        if not selected_item:
+            messagebox.showwarning("Warning", "Please select a user first.")
+            return
+
+        values = self.tree.item(selected_item, "values")
+        user_id = values[0]
+        username = values[1]
+
+        confirm = messagebox.askyesno(
+            "Confirm Delete",
+            f"Are you sure you want to delete user '{username}' and all their saved passwords?"
+        )
+
+        if confirm:
+            self.controller.db.delete_user(user_id)
+            messagebox.showinfo("Success", f"User '{username}' has been deleted.")
+            self.load_users()
 
 
 # ---------------------------- MAIN SCREEN ------------------------------- #
@@ -89,7 +421,7 @@ class MainScreen(tk.Frame):
     def __init__(self, parent, controller):
         super().__init__(parent)
         self.controller = controller
-        self.setup_ui()   # <-- now called here!
+        self.setup_ui()
 
     def setup_ui(self):
         # Logo
@@ -122,10 +454,13 @@ class MainScreen(tk.Frame):
         Button(self, text="Generate Password", command=self.generate_password).grid(row=3, column=2, sticky="w")
         Button(self, text="Add", width=40, command=self.save_password).grid(row=4, column=1, columnspan=2, sticky="e")
         Button(self, text="Show Passwords", width=40,
-               command=lambda: self.controller.show_frame(PasswordListScreen)).grid(row=5, column=1, columnspan=2, sticky="e")
+               command=lambda: self.controller.show_frame(PasswordListScreen)).grid(row=5, column=1, columnspan=2,
+                                                                                    sticky="e")
+        Button(self, text="Logout", width=40,
+               command=lambda: self.controller.show_frame(LoginScreen)).grid(row=6, column=1, columnspan=2, sticky="e")
 
     def generate_password(self):
-        password = self.controller.generator.generate()   
+        password = self.controller.generator.generate()
         self.password_entry.delete(0, END)
         self.password_entry.insert(0, password)
 
@@ -144,7 +479,7 @@ class MainScreen(tk.Frame):
         )
 
         if is_ok:
-            self.controller.db.insert_user(website, email, password)  #need fix here :D
+            self.controller.db.insert_user(website, email, password)
             self.website_entry.delete(0, END)
             self.password_entry.delete(0, END)
 
@@ -163,11 +498,10 @@ class PasswordListScreen(tk.Frame):
         self.tree.heading("Password", text="Password")
         self.tree.pack(fill="both", expand=True, padx=20, pady=20)
 
-        # 👇 bind double-click to copy
         self.tree.bind("<Double-1>", self.copy_password)
 
-        tk.Button(self, text="Back", command=lambda: controller.show_frame(MainScreen)).pack(pady=10)
-        tk.Button(self, text="Refresh", command=self.load_passwords).pack(pady=5)
+        Button(self, text="Back", command=lambda: controller.show_frame(MainScreen)).pack(pady=10)
+        Button(self, text="Refresh", command=self.load_passwords).pack(pady=5)
 
     def load_passwords(self):
         for row in self.tree.get_children():
@@ -175,15 +509,16 @@ class PasswordListScreen(tk.Frame):
 
         rows = self.controller.db.fetch_all()
         for row in rows:
-            self.tree.insert("", "end", values=(row[1], row[2], row[3]))
+            self.tree.insert("", "end", values=(row[2], row[3], row[4]))
 
     def copy_password(self, event):
         selected_item = self.tree.selection()
         if selected_item:
             values = self.tree.item(selected_item, "values")
-            password = values[2] 
+            password = values[2]
             pyperclip.copy(password)
             messagebox.showinfo("Copied", "Password copied to clipboard!")
+
 
 # ---------------------------- MAIN ------------------------------- #
 if __name__ == "__main__":
