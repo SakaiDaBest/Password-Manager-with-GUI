@@ -5,7 +5,37 @@ from tkinter import ttk
 from random import choice, randint, shuffle
 import pyperclip
 import mysql.connector
-import cryptography
+from cryptography.fernet import Fernet
+import base64
+import hashlib
+
+
+# ---------------------------- ENCRYPTION CLASS ------------------------------- #
+class EncryptionManager:
+    def __init__(self, master_key="default_master_key"):
+        """
+        Initialize encryption with a master key.
+        In production, use a secure key management system.
+        """
+        # Derive a 32-byte key from the master key using SHA-256
+        key = hashlib.sha256(master_key.encode()).digest()
+        # Encode to base64 for Fernet compatibility
+        self.key = base64.urlsafe_b64encode(key)
+        self.cipher = Fernet(self.key)
+
+    def encrypt(self, data):
+        """Encrypt data and return as string"""
+        if isinstance(data, str):
+            data = data.encode()
+        encrypted = self.cipher.encrypt(data)
+        return encrypted.decode()
+
+    def decrypt(self, encrypted_data):
+        """Decrypt data and return as string"""
+        if isinstance(encrypted_data, str):
+            encrypted_data = encrypted_data.encode()
+        decrypted = self.cipher.decrypt(encrypted_data)
+        return decrypted.decode()
 
 
 # ---------------------------- DATABASE CLASS ------------------------------- #
@@ -20,6 +50,7 @@ class DatabaseManager:
         self.cursor = self.conn.cursor()
         self.current_user_id = None
         self.is_admin = False
+        self.encryption = EncryptionManager()
         self._create_tables()
 
     def _create_tables(self):
@@ -33,14 +64,14 @@ class DatabaseManager:
             )
         """)
 
-        # Create users table for passwords (now with user_id foreign key)
+        # Create users table for passwords (with longer password field for encrypted data)
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 user_id INT,
-                website VARCHAR(50),
-                credential VARCHAR(50),
-                user_password VARCHAR(50),
+                website VARCHAR(255),
+                credential VARCHAR(255),
+                user_password TEXT,
                 FOREIGN KEY (user_id) REFERENCES login_users(id)
             )
         """)
@@ -48,7 +79,7 @@ class DatabaseManager:
         # Check if user_id column exists
         try:
             self.cursor.execute("SELECT user_id FROM users LIMIT 1")
-            self.cursor.fetchone()  # <-- FIX
+            self.cursor.fetchone()
         except mysql.connector.errors.ProgrammingError:
             print("Adding user_id column to users table...")
             self.cursor.execute("ALTER TABLE users ADD COLUMN user_id INT")
@@ -61,7 +92,7 @@ class DatabaseManager:
         # Check if is_admin column exists, if not add it
         try:
             self.cursor.execute("SELECT is_admin FROM login_users LIMIT 1")
-            self.cursor.fetchone()  # <-- FIX: read result
+            self.cursor.fetchone()
         except mysql.connector.errors.ProgrammingError:
             print("Adding is_admin column to login_users table...")
             self.cursor.execute("""
@@ -69,6 +100,15 @@ class DatabaseManager:
             """)
             self.conn.commit()
             print("is_admin column added successfully!")
+
+        # Modify user_password column to TEXT if it's not already
+        try:
+            self.cursor.execute("""
+                ALTER TABLE users MODIFY COLUMN user_password TEXT
+            """)
+            self.conn.commit()
+        except:
+            pass
 
         # Insert default admin user if not exists
         try:
@@ -106,14 +146,40 @@ class DatabaseManager:
         return False
 
     def insert_user(self, website, credential, user_password):
+        """Insert user credentials with encryption"""
+        # Encrypt sensitive data
+        encrypted_website = self.encryption.encrypt(website)
+        encrypted_credential = self.encryption.encrypt(credential)
+        encrypted_password = self.encryption.encrypt(user_password)
+
         query = "INSERT INTO users (user_id, website, credential, user_password) VALUES (%s, %s, %s, %s)"
-        self.cursor.execute(query, (self.current_user_id, website, credential, user_password))
+        self.cursor.execute(query, (self.current_user_id, encrypted_website, encrypted_credential, encrypted_password))
         self.conn.commit()
 
     def fetch_all(self):
+        """Fetch all passwords and decrypt them"""
         query = "SELECT * FROM users WHERE user_id=%s"
         self.cursor.execute(query, (self.current_user_id,))
-        return self.cursor.fetchall()
+        rows = self.cursor.fetchall()
+
+        # Decrypt the data
+        decrypted_rows = []
+        for row in rows:
+            try:
+                decrypted_row = (
+                    row[0],  # id
+                    row[1],  # user_id
+                    self.encryption.decrypt(row[2]),  # website
+                    self.encryption.decrypt(row[3]),  # credential
+                    self.encryption.decrypt(row[4])  # user_password
+                )
+                decrypted_rows.append(decrypted_row)
+            except Exception as e:
+                # If decryption fails (old unencrypted data), keep original
+                print(f"Decryption error for row {row[0]}: {e}")
+                decrypted_rows.append(row)
+
+        return decrypted_rows
 
     def get_all_users(self):
         """Admin function to get all users"""
@@ -194,6 +260,7 @@ class LoginScreen(tk.Frame):
     def setup_ui(self):
         # Title
         Label(self, text="Password Manager", font=("Arial", 20, "bold")).pack(pady=30)
+        Label(self, text="🔒 Encrypted Storage", font=("Arial", 10, "italic"), fg="green").pack(pady=5)
         Label(self, text="Login", font=("Arial", 14)).pack(pady=10)
 
         # Username
@@ -459,6 +526,11 @@ class MainScreen(tk.Frame):
         Button(self, text="Logout", width=40,
                command=lambda: self.controller.show_frame(LoginScreen)).grid(row=6, column=1, columnspan=2, sticky="e")
 
+        # Encryption indicator
+        Label(self, text="🔒 All passwords encrypted", font=("Arial", 9, "italic"), fg="green").grid(row=7, column=1,
+                                                                                                    columnspan=2,
+                                                                                                    pady=10)
+
     def generate_password(self):
         password = self.controller.generator.generate()
         self.password_entry.delete(0, END)
@@ -482,6 +554,7 @@ class MainScreen(tk.Frame):
             self.controller.db.insert_user(website, email, password)
             self.website_entry.delete(0, END)
             self.password_entry.delete(0, END)
+            messagebox.showinfo("Success", "Password saved and encrypted!")
 
 
 # ---------------------------- PASSWORD LIST SCREEN ------------------------------- #
@@ -491,6 +564,7 @@ class PasswordListScreen(tk.Frame):
         self.controller = controller
 
         tk.Label(self, text="Saved Passwords", font=("Arial", 16)).pack(pady=10)
+        tk.Label(self, text="🔒 Decrypted for viewing", font=("Arial", 9, "italic"), fg="green").pack(pady=5)
 
         self.tree = ttk.Treeview(self, columns=("Website", "Email", "Password"), show="headings")
         self.tree.heading("Website", text="Website")
