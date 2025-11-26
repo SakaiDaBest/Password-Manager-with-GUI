@@ -41,16 +41,26 @@ class EncryptionManager:
 # ---------------------------- DATABASE CLASS ------------------------------- #
 class DatabaseManager:
     def __init__(self, host="localhost", user="appuser", password="app_password", database="passwords"):
-        self.conn = mysql.connector.connect(
-            host=host,
-            user=user,
-            passwd=password,
-            database=database
-        )
+        try:
+            self.conn = mysql.connector.connect(
+                host=host,
+                user=user,
+                passwd=password,
+                database=database
+            )
+        except mysql.connector.Error as e:
+            temp_root = tk.Tk()
+            temp_root.withdraw()
+            messagebox.showerror("Database Connection Error",
+                                 f"Failed to connect to MySQL database:\n\n{e}")
+            temp_root.destroy()
+            raise SystemExit()
+
         self.cursor = self.conn.cursor()
         self.current_user_id = None
         self.is_admin = False
         self.encryption = EncryptionManager()
+
         self._create_tables()
 
     def _create_tables(self):
@@ -64,15 +74,15 @@ class DatabaseManager:
             )
         """)
 
-        # Create users table for passwords (with longer password field for encrypted data)
+        # Create users table for passwords with TEXT fields for encrypted data
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 user_id INT,
-                website VARCHAR(255),
-                credential VARCHAR(255),
+                website TEXT,
+                credential TEXT,
                 user_password TEXT,
-                FOREIGN KEY (user_id) REFERENCES login_users(id)
+                FOREIGN KEY (user_id) REFERENCES login_users(id) ON DELETE CASCADE
             )
         """)
 
@@ -85,7 +95,7 @@ class DatabaseManager:
             self.cursor.execute("ALTER TABLE users ADD COLUMN user_id INT")
             self.cursor.execute("""
                 ALTER TABLE users
-                ADD FOREIGN KEY (user_id) REFERENCES login_users(id)
+                ADD FOREIGN KEY (user_id) REFERENCES login_users(id) ON DELETE CASCADE
             """)
             self.conn.commit()
 
@@ -101,14 +111,9 @@ class DatabaseManager:
             self.conn.commit()
             print("is_admin column added successfully!")
 
-        # Modify user_password column to TEXT if it's not already
-        try:
-            self.cursor.execute("""
-                ALTER TABLE users MODIFY COLUMN user_password TEXT
-            """)
-            self.conn.commit()
-        except:
-            pass
+        # CRITICAL FIX: Modify columns to TEXT to handle encrypted data
+        print("Checking and updating column types for encryption support...")
+        self._upgrade_columns_for_encryption()
 
         # Insert default admin user if not exists
         try:
@@ -125,6 +130,106 @@ class DatabaseManager:
             self.conn.commit()
         except mysql.connector.IntegrityError:
             pass
+
+    def _upgrade_columns_for_encryption(self):
+        """
+        Upgrade database columns to support encrypted data.
+        This checks column types and modifies them if needed.
+        """
+        try:
+            # Get current column information
+            self.cursor.execute("""
+                SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                AND TABLE_NAME = 'users'
+                AND COLUMN_NAME IN ('website', 'credential', 'user_password')
+            """)
+            columns_info = self.cursor.fetchall()
+
+            needs_update = False
+            columns_to_update = []
+
+            for col_name, data_type, max_length in columns_info:
+                # Check if column is not TEXT type or has length restrictions
+                if data_type.upper() != 'TEXT':
+                    needs_update = True
+                    columns_to_update.append(col_name)
+                    print(f"Column '{col_name}' is {data_type}({max_length}), needs upgrade to TEXT")
+
+            if needs_update:
+                print("\n🔄 UPGRADING DATABASE SCHEMA FOR ENCRYPTION...")
+                print("=" * 60)
+
+                # Backup warning
+                print("⚠️  IMPORTANT: Creating backup of existing data...")
+
+                # Check if there's existing data
+                self.cursor.execute("SELECT COUNT(*) FROM users")
+                count = self.cursor.fetchone()[0]
+
+                if count > 0:
+                    print(f"⚠️  Found {count} existing password entries")
+                    print("⚠️  These will need to be re-encrypted or deleted!")
+
+                    # Option to backup old data (create a backup table)
+                    try:
+                        # Create backup table
+                        self.cursor.execute("""
+                            CREATE TABLE IF NOT EXISTS users_backup_unencrypted AS 
+                            SELECT * FROM users
+                        """)
+                        self.conn.commit()
+                        print("✅ Backup created: 'users_backup_unencrypted' table")
+                    except Exception as e:
+                        print(f"⚠️  Backup creation warning: {e}")
+
+                # Now modify the columns
+                print("\n📝 Modifying columns to TEXT type...")
+
+                try:
+                    self.cursor.execute("""
+                        ALTER TABLE users 
+                        MODIFY COLUMN website TEXT,
+                        MODIFY COLUMN credential TEXT,
+                        MODIFY COLUMN user_password TEXT
+                    """)
+                    self.conn.commit()
+                    print("✅ Columns successfully upgraded to TEXT type")
+                    print("✅ Database now supports encrypted data storage")
+
+                    if count > 0:
+                        print("\n⚠️  ACTION REQUIRED:")
+                        print("   - Old unencrypted data may cause decryption errors")
+                        print("   - Consider clearing old data or re-entering passwords")
+                        print("   - Backup table: 'users_backup_unencrypted'")
+
+                except mysql.connector.Error as e:
+                    print(f"❌ Error modifying columns: {e}")
+                    print("   You may need to manually run these SQL commands:")
+                    print("   ALTER TABLE users MODIFY COLUMN website TEXT;")
+                    print("   ALTER TABLE users MODIFY COLUMN credential TEXT;")
+                    print("   ALTER TABLE users MODIFY COLUMN user_password TEXT;")
+
+                print("=" * 60)
+                print()
+            else:
+                print("✅ Database columns already configured for encryption")
+
+        except mysql.connector.Error as e:
+            print(f"⚠️  Error checking column types: {e}")
+            print("   Attempting direct column modification...")
+            try:
+                self.cursor.execute("""
+                    ALTER TABLE users 
+                    MODIFY COLUMN website TEXT,
+                    MODIFY COLUMN credential TEXT,
+                    MODIFY COLUMN user_password TEXT
+                """)
+                self.conn.commit()
+                print("✅ Columns modified successfully")
+            except Exception as e2:
+                print(f"❌ Could not modify columns: {e2}")
 
     def create_user(self, username, password):
         try:
@@ -147,39 +252,54 @@ class DatabaseManager:
 
     def insert_user(self, website, credential, user_password):
         """Insert user credentials with encryption"""
-        # Encrypt sensitive data
-        encrypted_website = self.encryption.encrypt(website)
-        encrypted_credential = self.encryption.encrypt(credential)
-        encrypted_password = self.encryption.encrypt(user_password)
+        try:
+            # Encrypt sensitive data
+            encrypted_website = self.encryption.encrypt(website)
+            encrypted_credential = self.encryption.encrypt(credential)
+            encrypted_password = self.encryption.encrypt(user_password)
 
-        query = "INSERT INTO users (user_id, website, credential, user_password) VALUES (%s, %s, %s, %s)"
-        self.cursor.execute(query, (self.current_user_id, encrypted_website, encrypted_credential, encrypted_password))
-        self.conn.commit()
+            query = "INSERT INTO users (user_id, website, credential, user_password) VALUES (%s, %s, %s, %s)"
+            self.cursor.execute(query,
+                                (self.current_user_id, encrypted_website, encrypted_credential, encrypted_password))
+            self.conn.commit()
+            return True, "Password saved successfully!"
+        except Exception as e:
+            print(f"Error inserting data: {e}")
+            return False, f"Error saving password: {str(e)}"
 
     def fetch_all(self):
         """Fetch all passwords and decrypt them"""
-        query = "SELECT * FROM users WHERE user_id=%s"
+        query = "SELECT id, website, credential, user_password FROM users WHERE user_id=%s"
         self.cursor.execute(query, (self.current_user_id,))
         rows = self.cursor.fetchall()
 
-        # Decrypt the data
         decrypted_rows = []
         for row in rows:
             try:
                 decrypted_row = (
                     row[0],  # id
-                    row[1],  # user_id
-                    self.encryption.decrypt(row[2]),  # website
-                    self.encryption.decrypt(row[3]),  # credential
-                    self.encryption.decrypt(row[4])  # user_password
+                    self.encryption.decrypt(row[1]),  # website
+                    self.encryption.decrypt(row[2]),  # credential
+                    self.encryption.decrypt(row[3])  # user_password
                 )
                 decrypted_rows.append(decrypted_row)
             except Exception as e:
-                # If decryption fails (old unencrypted data), keep original
+                # If decryption fails (old unencrypted data), skip it
                 print(f"Decryption error for row {row[0]}: {e}")
-                decrypted_rows.append(row)
+
 
         return decrypted_rows
+
+    def delete_password(self, password_id):
+        """Delete a saved password entry"""
+        try:
+            query = "DELETE FROM users WHERE id=%s AND user_id=%s"
+            self.cursor.execute(query, (password_id, self.current_user_id))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error deleting password: {e}")
+            return False
 
     def get_all_users(self):
         """Admin function to get all users"""
@@ -200,6 +320,28 @@ class DatabaseManager:
         # Then delete the user account
         self.cursor.execute("DELETE FROM login_users WHERE id=%s", (user_id,))
         self.conn.commit()
+
+    def clear_all_passwords(self):
+        """Clear all password entries for current user (useful after schema upgrade)"""
+        try:
+            query = "DELETE FROM users WHERE user_id=%s"
+            self.cursor.execute(query, (self.current_user_id,))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error clearing passwords: {e}")
+            return False
+
+    def get_password_count(self):
+        """Get count of saved passwords for current user"""
+        try:
+            query = "SELECT COUNT(*) FROM users WHERE user_id=%s"
+            self.cursor.execute(query, (self.current_user_id,))
+            result = self.cursor.fetchone()
+            return result[0] if result else 0
+        except Exception as e:
+            print(f"Error getting password count: {e}")
+            return 0
 
 
 # ---------------------------- PASSWORD GENERATOR CLASS ------------------------------- #
@@ -366,7 +508,6 @@ class CreateUserScreen(tk.Frame):
             messagebox.showerror("Error", "Passwords do not match.")
             return
 
-        # Try to create user
         success, message = self.controller.db.create_user(username, password)
 
         if success:
@@ -390,7 +531,6 @@ class AdminDashboard(tk.Frame):
         tk.Label(self, text="Admin Dashboard", font=("Arial", 20, "bold")).pack(pady=20)
         tk.Label(self, text="Manage User Accounts", font=("Arial", 14)).pack(pady=10)
 
-        # Treeview for users
         self.tree = ttk.Treeview(self, columns=("ID", "Username", "Password"), show="headings", height=10)
         self.tree.heading("ID", text="ID")
         self.tree.heading("Username", text="Username")
@@ -402,7 +542,6 @@ class AdminDashboard(tk.Frame):
 
         self.tree.pack(fill="both", expand=True, padx=20, pady=20)
 
-        # Buttons frame
         button_frame = tk.Frame(self)
         button_frame.pack(pady=10)
 
@@ -413,11 +552,9 @@ class AdminDashboard(tk.Frame):
         Button(self, text="Logout", command=lambda: self.controller.show_frame(LoginScreen), width=20).pack(pady=10)
 
     def load_users(self):
-        # Clear existing data
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        # Load all users
         users = self.controller.db.get_all_users()
         for user in users:
             self.tree.insert("", "end", values=(user[0], user[1], user[2]))
@@ -432,7 +569,6 @@ class AdminDashboard(tk.Frame):
         user_id = values[0]
         username = values[1]
 
-        # Create popup window for editing
         edit_window = tk.Toplevel(self)
         edit_window.title(f"Edit Password for {username}")
         edit_window.geometry("300x150")
@@ -491,7 +627,6 @@ class MainScreen(tk.Frame):
         self.setup_ui()
 
     def setup_ui(self):
-        # Logo
         canvas = Canvas(self, height=200, width=200)
         try:
             self.logo_img = PhotoImage(file="logo.png")
@@ -500,7 +635,6 @@ class MainScreen(tk.Frame):
             pass
         canvas.grid(row=0, column=1, sticky="")
 
-        # Labels
         Label(self, text="Website:").grid(row=1, column=0, sticky="e")
         Label(self, text="Email/Username:").grid(row=2, column=0, sticky="e")
         Label(self, text="Password:").grid(row=3, column=0, sticky="e")
@@ -517,17 +651,16 @@ class MainScreen(tk.Frame):
         self.password_entry = Entry(self, width=23)
         self.password_entry.grid(row=3, column=1, sticky="e")
 
-        # Buttons
         Button(self, text="Generate Password", command=self.generate_password).grid(row=3, column=2, sticky="w")
         Button(self, text="Add", width=40, command=self.save_password).grid(row=4, column=1, columnspan=2, sticky="e")
         Button(self, text="Show Passwords", width=40,
                command=lambda: self.controller.show_frame(PasswordListScreen)).grid(row=5, column=1, columnspan=2,
                                                                                     sticky="e")
+        Button(self, text="Clear All Passwords", width=40, bg="#ff6b6b", fg="white",
+               command=self.clear_all_passwords).grid(row=6, column=1, columnspan=2, sticky="e")
         Button(self, text="Logout", width=40,
-               command=lambda: self.controller.show_frame(LoginScreen)).grid(row=6, column=1, columnspan=2, sticky="e")
-
-        # Encryption indicator
-        Label(self, text="🔒 All passwords encrypted", font=("Arial", 9, "italic"), fg="green").grid(row=7, column=1,
+               command=lambda: self.controller.show_frame(LoginScreen)).grid(row=7, column=1, columnspan=2, sticky="e")
+        Label(self, text="🔒 All passwords encrypted", font=("Arial", 9, "italic"), fg="green").grid(row=8, column=1,
                                                                                                     columnspan=2,
                                                                                                     pady=10)
 
@@ -551,10 +684,40 @@ class MainScreen(tk.Frame):
         )
 
         if is_ok:
-            self.controller.db.insert_user(website, email, password)
-            self.website_entry.delete(0, END)
-            self.password_entry.delete(0, END)
-            messagebox.showinfo("Success", "Password saved and encrypted!")
+            success, message = self.controller.db.insert_user(website, email, password)
+            if success:
+                self.website_entry.delete(0, END)
+                self.password_entry.delete(0, END)
+                messagebox.showinfo("Success", "Password saved and encrypted!")
+            else:
+                messagebox.showerror("Error", message)
+
+    def clear_all_passwords(self):
+        count = self.controller.db.get_password_count()
+
+        if count == 0:
+            messagebox.showinfo("Info", "You don't have any saved passwords.")
+            return
+
+        confirm = messagebox.askyesno(
+            "Confirm Clear All",
+            f"Are you sure you want to delete all {count} saved password(s)?\n\n"
+            "This action cannot be undone!\n\n"
+            "This is useful if you have old unencrypted data causing errors."
+        )
+
+        if confirm:
+            double_confirm = messagebox.askyesno(
+                "Final Confirmation",
+                "This will permanently delete all your saved passwords.\n\n"
+                "Are you absolutely sure?"
+            )
+
+            if double_confirm:
+                if self.controller.db.clear_all_passwords():
+                    messagebox.showinfo("Success", "All passwords have been cleared!")
+                else:
+                    messagebox.showerror("Error", "Failed to clear passwords.")
 
 
 # ---------------------------- PASSWORD LIST SCREEN ------------------------------- #
@@ -566,16 +729,38 @@ class PasswordListScreen(tk.Frame):
         tk.Label(self, text="Saved Passwords", font=("Arial", 16)).pack(pady=10)
         tk.Label(self, text="🔒 Decrypted for viewing", font=("Arial", 9, "italic"), fg="green").pack(pady=5)
 
-        self.tree = ttk.Treeview(self, columns=("Website", "Email", "Password"), show="headings")
+        tree_frame = tk.Frame(self)
+        tree_frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        scrollbar = ttk.Scrollbar(tree_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        self.tree = ttk.Treeview(tree_frame, columns=("ID", "Website", "Email", "Password"),
+                                 show="headings", yscrollcommand=scrollbar.set)
+        self.tree.heading("ID", text="ID")
         self.tree.heading("Website", text="Website")
         self.tree.heading("Email", text="Email")
         self.tree.heading("Password", text="Password")
-        self.tree.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self.tree.column("ID", width=50)
+        self.tree.column("Website", width=150)
+        self.tree.column("Email", width=150)
+        self.tree.column("Password", width=150)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.tree.yview)
 
         self.tree.bind("<Double-1>", self.copy_password)
 
-        Button(self, text="Back", command=lambda: controller.show_frame(MainScreen)).pack(pady=10)
-        Button(self, text="Refresh", command=self.load_passwords).pack(pady=5)
+        button_frame = tk.Frame(self)
+        button_frame.pack(pady=10)
+
+        Button(button_frame, text="Copy Password", command=self.copy_selected_password, width=15).pack(side="left",
+                                                                                                       padx=5)
+        Button(button_frame, text="Delete Entry", command=self.delete_entry, width=15).pack(side="left", padx=5)
+        Button(button_frame, text="Refresh", command=self.load_passwords, width=15).pack(side="left", padx=5)
+
+        Button(self, text="Back", command=lambda: controller.show_frame(MainScreen), width=20).pack(pady=5)
 
     def load_passwords(self):
         for row in self.tree.get_children():
@@ -583,15 +768,46 @@ class PasswordListScreen(tk.Frame):
 
         rows = self.controller.db.fetch_all()
         for row in rows:
-            self.tree.insert("", "end", values=(row[2], row[3], row[4]))
+            masked_password = "*" * len(row[3])
+            self.tree.insert("", "end", values=(row[0], row[1], row[2], masked_password))
 
     def copy_password(self, event):
+        self.copy_selected_password()
+
+    def copy_selected_password(self):
         selected_item = self.tree.selection()
         if selected_item:
             values = self.tree.item(selected_item, "values")
-            password = values[2]
-            pyperclip.copy(password)
-            messagebox.showinfo("Copied", "Password copied to clipboard!")
+            password_id = values[0]
+
+            rows = self.controller.db.fetch_all()
+            for row in rows:
+                if row[0] == int(password_id):
+                    pyperclip.copy(row[3])
+                    messagebox.showinfo("Copied", "Password copied to clipboard!")
+                    break
+
+    def delete_entry(self):
+        selected_item = self.tree.selection()
+        if not selected_item:
+            messagebox.showwarning("Warning", "Please select an entry first.")
+            return
+
+        values = self.tree.item(selected_item, "values")
+        password_id = values[0]
+        website = values[1]
+
+        confirm = messagebox.askyesno(
+            "Confirm Delete",
+            f"Are you sure you want to delete the password for '{website}'?"
+        )
+
+        if confirm:
+            if self.controller.db.delete_password(password_id):
+                messagebox.showinfo("Success", "Password entry deleted!")
+                self.load_passwords()
+            else:
+                messagebox.showerror("Error", "Failed to delete entry.")
 
 
 # ---------------------------- MAIN ------------------------------- #
